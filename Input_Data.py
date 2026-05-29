@@ -1,0 +1,199 @@
+import os
+import time
+import json
+import requests
+import pandas as pd
+import numpy as np
+import gspread
+from google.oauth2.service_account import Credentials
+
+# -------------------- START TIMER --------------------
+start_time = time.time()
+
+# -------------------- ENV VARIABLES --------------------
+sec = os.getenv("PRABHAT_SECRET_KEY")
+User_name = os.getenv("USERNAME")
+service_account_json = os.getenv("SERVICE_ACCOUNT_JSON")
+MB_URL = os.getenv("METABASE_URL")
+QUERY_URL = os.getenv("DAILY_INPUT_QUERY")
+SAK = os.getenv("SHEET_ACCESS_KEY")
+
+TARGET_SHEET = "Helper Call Dump"
+
+if not sec or not service_account_json:
+    raise ValueError("❌ Missing environment variables. Check GitHub secrets.")
+
+# -------------------- GOOGLE AUTH --------------------
+service_info = json.loads(service_account_json)
+
+creds = Credentials.from_service_account_info(
+    service_info,
+    scopes=[
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+)
+
+gc = gspread.authorize(creds)
+
+# -------------------- METABASE LOGIN --------------------
+print("🔐 Creating Metabase session...")
+
+res = requests.post(
+    MB_URL,
+    headers={"Content-Type": "application/json"},
+    json={"username": User_name, "password": sec},
+    timeout=60
+)
+
+res.raise_for_status()
+token = res.json()['id']
+
+METABASE_HEADERS = {
+    "Content-Type": "application/json",
+    "X-Metabase-Session": token
+}
+
+print("✅ Metabase session created")
+
+# -------------------- FETCH WITH RETRY --------------------
+def fetch_with_retry(url, headers, retries=5):
+    for attempt in range(1, retries + 1):
+        try:
+            response = requests.post(url, headers=headers, timeout=180)
+            response.raise_for_status()
+            return response
+        except Exception as e:
+            wait_time = 10 * attempt
+            print(f"[Metabase] Attempt {attempt} failed: {e}")
+            if attempt < retries:
+                print(f"⏳ Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                raise
+
+# -------------------- SAFE SHEET UPDATE --------------------
+def safe_update_sheet(worksheet, df, retries=5):
+    print(f"🔄 Updating worksheet: {worksheet.title}")
+
+    for attempt in range(1, retries + 1):
+        try:
+            rows = len(df) + 1
+            cols = len(df.columns)
+
+            # Clear only A:AD
+            worksheet.batch_clear(["A:AD"])
+
+            clean_df = df.copy()
+
+            # Replace infinities and NaN
+            clean_df = clean_df.replace([float("inf"), float("-inf")], "")
+            clean_df = clean_df.fillna("")
+
+            # Convert ONLY non-duration columns to string
+            # Convert ONLY non-duration columns to string
+            for col in clean_df.columns:
+                if col != "duration":
+                    clean_df[col] = clean_df[col].astype(str)
+            
+            # 🔥 Properly clean duration (fix comma issue)
+            clean_df["duration"] = (
+                clean_df["duration"]
+                    .astype(str)
+                    .str.replace(",", "", regex=False)
+            )
+            
+            clean_df["duration"] = pd.to_numeric(
+                clean_df["duration"], errors="coerce"
+            ).fillna(0)
+
+            values = [list(clean_df.columns)] + clean_df.values.tolist()
+
+            def col_num_to_letter(n):
+                result = ""
+                while n > 0:
+                    n, remainder = divmod(n - 1, 26)
+                    result = chr(65 + remainder) + result
+                return result
+
+            worksheet.update(
+                values=values,
+                range_name=f"A1:{col_num_to_letter(cols)}{rows}"
+            )
+            
+
+            print(f"✅ Sheet updated successfully: {worksheet.title}")
+            return True
+
+        except Exception as e:
+            wait_time = 15 * attempt
+            print(f"[Sheets] Attempt {attempt} failed: {e}")
+
+            if attempt < retries:
+                print(f"⏳ Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                raise
+
+
+# -------------------- MAIN EXECUTION --------------------
+print("📥 Fetching Input query from Metabase...")
+
+response = fetch_with_retry(QUERY_URL, METABASE_HEADERS)
+df_Input = pd.DataFrame(response.json())
+
+if df_Input.empty:
+    print("⚠️ WARNING: Input query returned empty dataset.")
+
+# -------------------- REQUIRED COLUMN ORDER (DO NOT CHANGE) --------------------
+required_cols = [
+    'lead_created_on', 'modified_on', 'prospect_email', 'prospect_id', 'prospect_stage',
+    'mx_prospect_status', 'crm_user_role', 'sales_user_email',
+    'mx_utm_medium', 'mx_utm_source', 'mx_lead_quality_grade',
+    'mx_lead_inherent_intent', 'mx_priority_status',
+    'mx_organic_inbound', 'lead_last_call_status',
+    'mx_city', 'event', 'current_stage', 'previous_stage',
+    'mx_identifer', 'mx_phoenix_identifer',
+    'call_type', 'duration', 'caller',
+    'lead_owner', 'caller_receiver_final', 'event_date', 'team_lead', 'course', 'm0_or_not', 
+]
+
+missing_cols = [col for col in required_cols if col not in df_Input.columns]
+if missing_cols:
+    raise ValueError(f"❌ Missing columns from query: {missing_cols}")
+
+df_Input = df_Input[required_cols]
+
+# -------------------- HARD CLEAN FOR GOOGLE SHEETS --------------------
+
+import numpy as np
+
+# Replace infinities
+df_Input.replace([np.inf, -np.inf], None, inplace=True)
+
+# Replace NaN with empty string
+df_Input = df_Input.fillna("")
+
+# Convert EVERYTHING to string
+df_Input = df_Input.astype(str)
+
+
+
+
+print("📊 Rows fetched:", len(df_Input))
+
+# -------------------- GOOGLE SHEETS UPDATE --------------------
+print("🔗 Connecting to Google Sheets...")
+sheet = gc.open_by_key(SAK)
+ws_input = sheet.worksheet(TARGET_SHEET)
+
+print("⬆️ Updating Helper Call Dump...")
+safe_update_sheet(ws_input, df_Input)
+
+# -------------------- TIMER SUMMARY --------------------
+end_time = time.time()
+elapsed = end_time - start_time
+mins, secs = divmod(elapsed, 60)
+
+print(f"⏱ Total execution time: {int(mins)}m {int(secs)}s")
+print("🎯 Input Data Automation Completed Successfully!")
